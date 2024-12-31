@@ -622,7 +622,8 @@ def create_analysis_layout():
     def get_all_symbols():
         default_symbols = ['SPY', 'QQQ', 'IWM', 'AAPL', 'AMZN', 'GOOG', 'META', 'MSFT', 'NVDA', 'TSLA']
         custom_symbols = load_custom_symbols()
-        return list(set(default_symbols + custom_symbols))  # Remove duplicates
+        all_symbols = list(set(default_symbols + custom_symbols))  # Remove duplicates
+        return sorted(all_symbols)  # Sort alphabetically
 
     all_symbols = get_all_symbols()
     
@@ -654,8 +655,7 @@ def create_analysis_layout():
                         {'label': '1D', 'value': '1D'},
                         {'label': '2D', 'value': '2D'},
                         {'label': '3D', 'value': '3D'},
-                        {'label': '4D', 'value': '4D'},
-                        {'label': '5D', 'value': '5D'},
+                        {'label': '4D', 'value': '4D'},                        
                         {'label': '1W', 'value': '1W'},
                         {'label': '1M', 'value': '1M'},
                         {'label': '3M', 'value': '3M'},
@@ -1343,10 +1343,25 @@ def get_all_symbols():
     [Input('symbol-dropdown', 'value')]
 )
 def update_date_dropdown(symbol):
-    expiration_dates = get_options_expirations(symbol)
-    options = [{'label': date, 'value': date} for date in expiration_dates]
-    value = expiration_dates[0] if expiration_dates else None
-    return options, value
+    try:
+        expiration_dates = get_options_expirations(symbol)
+        if not expiration_dates:
+            # If no dates returned, create some default ones
+            today = datetime.now()
+            expiration_dates = [(today + timedelta(days=x)).strftime('%Y-%m-%d') 
+                              for x in range(0, 28, 7)]
+        
+        options = [{'label': date, 'value': date} for date in expiration_dates]
+        value = expiration_dates[0] if expiration_dates else None
+        return options, value
+    except Exception as e:
+        print(f"Error in update_date_dropdown: {str(e)}")
+        # Return default values
+        today = datetime.now()
+        default_dates = [(today + timedelta(days=x)).strftime('%Y-%m-%d') 
+                        for x in range(0, 28, 7)]
+        options = [{'label': date, 'value': date} for date in default_dates]
+        return options, default_dates[0]
 
 @app.callback(
     [Output('symbol-dropdown', 'options'),
@@ -1357,8 +1372,8 @@ def update_date_dropdown(symbol):
 )
 def add_symbol(n_clicks, new_symbol, existing_options):
     if n_clicks is None or not new_symbol:
-        # Initial load - combine default and custom symbols
-        all_symbols = get_all_symbols()
+        # Initial load - combine default and custom symbols and sort
+        all_symbols = sorted(get_all_symbols())
         return [{'label': s, 'value': s} for s in all_symbols], ''
     
     # Convert new symbol to uppercase
@@ -1439,18 +1454,20 @@ def get_current_price(symbol, is_sandbox=False):
         return None
 
 def is_trading_hours():
-    pacific_tz = pytz.timezone('America/Los_Angeles')
-    current_time = datetime.now(pacific_tz)
+    """Check if market is currently open"""
+    eastern_tz = pytz.timezone('US/Eastern')
+    current_time = datetime.now(eastern_tz)
     
     # Check for weekends first
     if current_time.weekday() >= 5:  # Weekend
         return False
-        
-    # Define extended market hours (including pre and post market)
-    pre_market_open = dt_time(1, 0)   # 1:00 AM PT (4:00 AM ET)
-    post_market_close = dt_time(17, 0)  # 5:00 PM PT (8:00 PM ET)
     
-    return pre_market_open <= current_time.time() <= post_market_close
+    # Define market hours in ET
+    market_open = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
+    
+    # Check if within regular trading hours
+    return market_open <= current_time <= market_close
 
 def get_last_trading_day():
     """Get the most recent trading day with extended hours"""
@@ -1718,52 +1735,41 @@ def get_data_for_timeframe_and_interval(symbol, timeframe, interval):
     try:
         now = datetime.now(pytz.timezone('US/Eastern'))
         
-        # Define timeframe days
-        timeframe_days = {
-            '1D': 1,
-            '2D': 2,
-            '3D': 3,
-            '4D': 4,
-            '5D': 5,
-            '1W': 7,
-            '1M': 30,
-            '3M': 90,
-            '6M': 180,
-            '1Y': 365
-        }
+        # Calculate number of calendar days to fetch based on timeframe
+        days_to_fetch = {
+            '1D': 2,      # Fetch 2 days to ensure we get full day
+            '2D': 3,      # Fetch 3 days to ensure we get 2 days
+            '3D': 4,      # Fetch 4 days to ensure we get 3 days
+            '4D': 5,      # Fetch 5 days to ensure we get 4 days
+            '1W': 8,      # Fetch 8 days to ensure we get a week
+            '1M': 35,     # Fetch 35 days to ensure we get a month
+            '3M': 95,     # Fetch 95 days to ensure we get 3 months
+            '6M': 185,    # Fetch 185 days to ensure we get 6 months
+            '1Y': 370     # Fetch 370 days to ensure we get a year
+        }.get(timeframe, 2)
         
-        days = timeframe_days.get(timeframe, 1)
-        start_time = now - timedelta(days=days)
+        start_time = now - timedelta(days=days_to_fetch)
         
-        # Special handling for daily data
         if interval == 'daily':
             df = get_daily_prices(symbol, start_time)
             if df is not None and not df.empty:
-                # Ensure proper timezone handling
-                df['time'] = pd.to_datetime(df['date'])
-                df['time'] = df['time'].dt.tz_localize('US/Eastern').dt.tz_convert('US/Pacific')
-                # Calculate indicators
-                df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
-                df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
-                df['SMA200'] = df['close'].rolling(window=200, min_periods=1).mean()
-                df['RSI'] = calculate_rsi(df['close'])
-                df = calculate_ttm_squeeze(df)
+                df = process_daily_data(df, timeframe)
                 return df
         else:
-            # Handle intraday data
             interval_minutes = {
-                '1min': 1, '5min': 5, '15min': 15, '30min': 30,
-                '1hour': 60, '2hour': 120, '4hour': 240
+                '1min': 1,
+                '5min': 5,
+                '15min': 15,
+                '30min': 30,
+                '1hour': 60,
+                '2hour': 120,
+                '4hour': 240
             }.get(interval)
             
             if interval_minutes:
-                df = get_timesales_data(symbol, start_time, now, interval_minutes)
+                df = get_timesales_data_improved(symbol, start_time, now, interval_minutes)
                 if df is not None and not df.empty:
-                    df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
-                    df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
-                    df['SMA200'] = df['close'].rolling(window=200, min_periods=1).mean()
-                    df['RSI'] = calculate_rsi(df['close'])
-                    df = calculate_ttm_squeeze(df)
+                    df = process_intraday_data(df, timeframe)
                     return df
         
         return None
@@ -1773,50 +1779,163 @@ def get_data_for_timeframe_and_interval(symbol, timeframe, interval):
         traceback.print_exc()
         return None
 
-def get_timesales_data(symbol, start_time, end_time, interval_minutes):
+def process_daily_data(df, timeframe):
+    if df is None or df.empty:
+        return df
+        
+    df = df.copy()
+    
+    # Ensure time column exists and is timezone aware
+    if 'time' not in df.columns:
+        df['time'] = pd.to_datetime(df['date'])
+    if df['time'].dt.tz is None:
+        df['time'] = df['time'].dt.tz_localize('US/Eastern')
+    
+    # Filter for trading days (Monday-Friday)
+    df = df[df['time'].dt.dayofweek < 5]
+    
+    # Calculate indicators
+    df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['SMA200'] = df['close'].rolling(window=200, min_periods=1).mean()
+    df['RSI'] = calculate_rsi(df['close'])
+    df = calculate_ttm_squeeze(df)
+    
+    # Get the required number of trading days
+    num_days = int(timeframe[0]) if timeframe[1] == 'D' else {
+        '1W': 5, '1M': 21, '3M': 63, '6M': 126, '1Y': 252
+    }.get(timeframe, 1)
+    
+    # Sort by date and take the most recent N trading days
+    df = df.sort_values('time', ascending=True)
+    df = df.tail(num_days)
+    
+    # Convert time to end of day for proper display
+    df['time'] = df['time'].apply(lambda x: x.replace(hour=16, minute=0))
+    
+    return df
+
+def process_intraday_data(df, timeframe):
+    """Process intraday data with proper trading day filtering"""
+    if df is None or df.empty:
+        return df
+        
+    df = df.copy()
+    
+    # Ensure timezone
+    if df['time'].dt.tz is None:
+        df['time'] = df['time'].dt.tz_localize('US/Eastern')
+    
+    # Filter for trading days
+    df = df[df['time'].dt.dayofweek < 5]
+    
+    # Filter for regular trading hours (9:30 AM - 4:00 PM ET)
+    trading_hours_mask = (
+        ((df['time'].dt.hour == 9) & (df['time'].dt.minute >= 30)) |
+        ((df['time'].dt.hour > 9) & (df['time'].dt.hour < 16))
+    )
+    df = df[trading_hours_mask]
+    
+    # Calculate indicators
+    df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['SMA200'] = df['close'].rolling(window=200, min_periods=1).mean()
+    df['RSI'] = calculate_rsi(df['close'])
+    df = calculate_ttm_squeeze(df)
+    df['vwap'] = calculate_vwap(df)
+    
+    # Get unique trading days
+    df['date'] = df['time'].dt.date
+    trading_days = sorted(df['date'].unique())
+    
+    # Get required number of trading days
+    num_days = int(timeframe[0]) if timeframe[1] == 'D' else {
+        '1W': 5, '1M': 21, '3M': 63, '6M': 126, '1Y': 252
+    }.get(timeframe, 1)
+    
+    # Take the most recent N trading days
+    if len(trading_days) > num_days:
+        keep_days = trading_days[-num_days:]
+        df = df[df['date'].isin(keep_days)]
+    
+    # Drop the date column we added
+    df = df.drop('date', axis=1)
+    
+    return df
+
+def filter_last_n_trading_days(df, n_days):
+    """Filter dataframe to keep only the last N trading days"""
+    if df is None or df.empty:
+        return df
+        
+    df = df.copy()
+    
+    # Get unique trading days
+    trading_days = pd.Series(df['time'].dt.date).unique()
+    
+    # Sort and take the last N days
+    last_n_days = sorted(trading_days)[-n_days:]
+    
+    # Filter dataframe
+    return df[df['time'].dt.date.isin(last_n_days)]
+
+def get_timesales_data_improved(symbol, start_time, end_time, interval_minutes):
+    """Get time sales data with improved error handling and chunking"""
     chunks = []
     current_start = start_time
     
     while current_start < end_time:
-        # Extend chunk size to 5 days for better data continuity
-        chunk_end = min(current_start + timedelta(days=5), end_time)
-        
-        access_token, base_url = get_tradier_credentials(False)
-        url = f"{base_url}markets/timesales"
-        
-        params = {
-            'symbol': symbol,
-            'interval': f'{interval_minutes}min',
-            'start': current_start.strftime('%Y-%m-%d %H:%M:%S'),
-            'end': chunk_end.strftime('%Y-%m-%d %H:%M:%S'),
-            'session_filter': 'all'  # Include all sessions
-        }
+        chunk_end = min(current_start + timedelta(days=1), end_time)
         
         try:
+            access_token, base_url = get_tradier_credentials(False)
+            url = f"{base_url}markets/timesales"
+            
+            params = {
+                'symbol': symbol,
+                'interval': f'{interval_minutes}min',
+                'start': current_start.strftime('%Y-%m-%d %H:%M:%S'),
+                'end': chunk_end.strftime('%Y-%m-%d %H:%M:%S'),
+                'session_filter': 'all'
+            }
+            
             headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
             response = requests.get(url, headers=headers, params=params)
             
             if response.status_code == 200:
                 data = response.json()
-                if data and 'series' in data and 'data' in data['series']:
-                    chunk_df = pd.DataFrame(data['series']['data'])
-                    if not chunk_df.empty:
-                        chunks.append(chunk_df)
-                        
+                # Handle case where 'series' might be None
+                if data and 'series' in data and data['series'] is not None:
+                    # Handle case where 'data' might be None or not a list
+                    series_data = data['series'].get('data', [])
+                    if series_data:
+                        # Convert single dict to list if necessary
+                        if isinstance(series_data, dict):
+                            series_data = [series_data]
+                        chunk_df = pd.DataFrame(series_data)
+                        if not chunk_df.empty:
+                            chunks.append(chunk_df)
+            
             time.sleep(0.1)  # Rate limiting
             
         except Exception as e:
-            print(f"Error fetching chunk: {str(e)}")
+            print(f"Error fetching chunk for {symbol} from {current_start} to {chunk_end}: {str(e)}")
+            traceback.print_exc()
         
         current_start = chunk_end + timedelta(seconds=1)
     
     if chunks:
-        df = pd.concat(chunks, ignore_index=True)
-        df['time'] = pd.to_datetime(df['time'])
-        df['time'] = df['time'].dt.tz_localize('US/Eastern')
-        df['time'] = df['time'].dt.tz_convert('US/Pacific')
-        return df
+        try:
+            df = pd.concat(chunks, ignore_index=True)
+            df['time'] = pd.to_datetime(df['time'])
+            df['time'] = df['time'].dt.tz_localize('US/Eastern')
+            return df
+        except Exception as e:
+            print(f"Error processing chunks for {symbol}: {str(e)}")
+            traceback.print_exc()
+            return pd.DataFrame()
     
+    print(f"No data found for {symbol} between {start_time} and {end_time}")
     return pd.DataFrame()
 
 def resample_daily_data(df, rule):
@@ -1840,15 +1959,17 @@ def get_daily_prices(symbol, start_date, is_sandbox=False):
     if isinstance(start_date, (datetime, pd.Timestamp)):
         start_date = start_date.strftime('%Y-%m-%d')
     
-    end_date = datetime.now().strftime('%Y-%m-%d')
+    # Get current date in Eastern Time
+    eastern_tz = pytz.timezone('US/Eastern')
+    current_et = datetime.now(eastern_tz)
+    end_date = current_et.strftime('%Y-%m-%d')
     
     url = f"{base_url}markets/history"
     params = {
         'symbol': symbol,
-        'interval': 'daily',
         'start': start_date,
         'end': end_date,
-        'session_filter': 'all'  # Include all sessions
+        'interval': 'daily'
     }
     
     try:
@@ -1857,22 +1978,26 @@ def get_daily_prices(symbol, start_date, is_sandbox=False):
         
         if response.status_code == 200:
             data = response.json()
-            if 'history' in data and 'day' in data['history']:
+            if data and 'history' in data and data['history'] is not None and 'day' in data['history']:
                 df = pd.DataFrame(data['history']['day'])
                 if not df.empty:
                     df['time'] = pd.to_datetime(df['date'])
-                    df['time'] = df['time'].dt.tz_localize('US/Eastern').dt.tz_convert('US/Pacific')
+                    df['time'] = df['time'].dt.tz_localize('US/Eastern')
+                    
+                    # Convert to Pacific Time for display
+                    df['time'] = df['time'].dt.tz_convert('US/Pacific')
+                    
                     # Convert numeric columns
                     for col in ['open', 'high', 'low', 'close', 'volume']:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
                     return df.sort_values('time')
-                
-        print(f"No daily data received for {symbol}")
+        
+        print(f"Failed to get daily data for {symbol}")
         return pd.DataFrame()
         
     except Exception as e:
         print(f"Error retrieving daily data: {str(e)}")
-        traceback.print_exc()
         return pd.DataFrame()
 
 def get_extended_strike_range(current_price, additional_strikes=3):
@@ -1886,32 +2011,42 @@ def get_extended_strike_range(current_price, additional_strikes=3):
     return min(lower_strikes), max(upper_strikes)
 
 def get_options_expirations(symbol, is_sandbox=False, max_days=30):
-    access_token, base_url = get_tradier_credentials(is_sandbox)
-    url = f"{base_url}markets/options/expirations?symbol={symbol}"
-    headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
-    response = requests.get(url, headers=headers)
+    try:
+        access_token, base_url = get_tradier_credentials(is_sandbox)
+        url = f"{base_url}markets/options/expirations?symbol={symbol}"
+        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=10)  # Add timeout
+            if response.status_code == 200:
+                expiration_dates = response.json().get('expirations', {}).get('date', [])
+                filtered_dates = []
 
-    if response.status_code == 200:
-        expiration_dates = response.json().get('expirations', {}).get('date', [])
-        filtered_dates = []
+                if not expiration_dates:
+                    return []
 
-        if not expiration_dates:
-            return []
+                pst = pytz.timezone('America/Los_Angeles')
+                now_pst = datetime.now(pst)
 
-        pst = pytz.timezone('America/Los_Angeles')
-        now_pst = datetime.now(pst)
+                for date in expiration_dates:
+                    expiration_date = datetime.strptime(date, '%Y-%m-%d')
+                    expiration_date_pst = pst.localize(expiration_date)
+                    days_difference = (expiration_date_pst.date() - now_pst.date()).days
 
-        for date in expiration_dates:
-            expiration_date = datetime.strptime(date, '%Y-%m-%d')
-            expiration_date_pst = pst.localize(expiration_date)
-            days_difference = (expiration_date_pst.date() - now_pst.date()).days
+                    if 0 <= days_difference <= max_days:
+                        filtered_dates.append(date)
 
-            if 0 <= days_difference <= max_days:
-                filtered_dates.append(date)
-
-        return filtered_dates
-    else:
-        print(f"Failed to retrieve options expirations for {symbol}. Status code: {response.status_code}")
+                return filtered_dates
+        except requests.exceptions.RequestException as e:
+            print(f"Network error in get_options_expirations: {str(e)}")
+            # Return some default dates as fallback
+            today = datetime.now()
+            default_dates = [(today + timedelta(days=x)).strftime('%Y-%m-%d') 
+                           for x in range(0, max_days, 7)]
+            return default_dates[:4]  # Return first 4 weekly expirations
+            
+    except Exception as e:
+        print(f"Error in get_options_expirations: {str(e)}")
         return []
 
 def get_options_data(symbol, expiration_date, is_sandbox=False):
@@ -2702,7 +2837,7 @@ def get_advances_declines(is_sandbox=False):
     return fig1, fig5, fig_daily
 
 def create_ma_signals(df):
-    """Generate moving average signals with simplified TTM Squeeze status"""
+    """Generate moving average signals with TTM Squeeze status and VWAP"""
     try:
         if df is None or df.empty:
             return html.Div("No data available", style={'color': 'white'})
@@ -2723,7 +2858,7 @@ def create_ma_signals(df):
                 signals.append(html.Div("50 EMA below 200 SMA (Death Cross)", style={'color': 'red'}))
         
         # TTM Squeeze Status
-        df = calculate_ttm_squeeze(df)  # Calculate TTM Squeeze
+        df = calculate_ttm_squeeze(df)
         squeeze_status, squeeze_bars = get_squeeze_status(df)
         
         squeeze_color = 'red' if squeeze_status == "IN SQUEEZE" else 'white'
@@ -2735,6 +2870,19 @@ def create_ma_signals(df):
             html.Div("TTM Squeeze:", style={'color': '#888', 'marginTop': '10px'}),
             html.Div(squeeze_text, style={'color': squeeze_color})
         ]))
+        
+        # Add VWAP Status
+        if 'vwap' in df.columns:
+            current_price = df['close'].iloc[-1]
+            vwap = df['vwap'].iloc[-1]
+            
+            vwap_color = 'green' if current_price > vwap else 'red'
+            vwap_text = f"Above VWAP" if current_price > vwap else "Below VWAP"
+            
+            signals.append(html.Div([
+                html.Div("VWAP Status:", style={'color': '#888', 'marginTop': '10px'}),
+                html.Div(f"{vwap_text} (VWAP: {vwap:.2f})", style={'color': vwap_color})
+            ]))
         
         return html.Div(signals)
         
@@ -3414,7 +3562,7 @@ def create_tick_matrix(total_gex, total_vex, total_dex, total_vega, state_number
     prevent_initial_call=True
 )
 def update_analysis_content(n_intervals, n_clicks, symbol, timeframe, interval, stored_settings):
-    # Always initialize with empty analysis in case of errors
+    # Initialize with empty analysis
     empty_results = create_empty_analysis()
     
     try:
@@ -3461,35 +3609,33 @@ def update_analysis_content(n_intervals, n_clicks, symbol, timeframe, interval, 
         # Create all required outputs
         return (
             create_analysis_price_chart(df, symbol, timeframe),  # price chart
-            create_rsi_chart(df),                               # rsi chart
-            create_ma_signals(df),                             # ma signals
-            create_oscillator_signals(df),                     # oscillator signals
-            calculate_pivot_points(df),                        # pivot points
-            identify_support_levels(df),                       # support levels
-            identify_resistance_levels(df),                    # resistance levels
+            create_rsi_chart(df, timeframe),                     # rsi chart with timeframe parameter
+            create_ma_signals(df),                               # ma signals
+            create_oscillator_signals(df),                       # oscillator signals
+            calculate_pivot_points(df),                          # pivot points
+            identify_support_levels(df),                         # support levels
+            identify_resistance_levels(df),                      # resistance levels
             calculate_iv_percentile(get_options_data(symbol, datetime.now().strftime('%Y-%m-%d'))),  # iv percentile
             calculate_put_call_ratio(get_options_data(symbol, datetime.now().strftime('%Y-%m-%d'))), # put/call ratio
-            header_price,                                      # header price
-            current_settings                                   # settings
+            header_price,                                        # header price
+            current_settings                                     # settings
         )
         
     except Exception as e:
         print(f"Error in update_analysis_content: {str(e)}")
         traceback.print_exc()
-        return empty_results  # Return empty analysis on any error
+        return empty_results
 
 @app.callback(
     Output('analysis-symbol-dropdown', 'options'),
     [Input('tabs', 'value')],
-    prevent_initial_call=True  # Add this to prevent initial call
+    prevent_initial_call=True
 )
-def update_analysis_symbols(*args):  # Change to accept variable arguments
-    tab = args[0]  # Get the tab value from args
+def update_analysis_symbols(tab):
     if tab == 'analysis':
-        all_symbols = get_all_symbols()
+        all_symbols = sorted(get_all_symbols())  # Sort the symbols
         return [{'label': s, 'value': s} for s in all_symbols]
     return []
-
 
 # Keep the existing callback for initializing analysis settings
 @app.callback(
@@ -3500,13 +3646,14 @@ def update_analysis_symbols(*args):  # Change to accept variable arguments
     [State('analysis-settings', 'data')]
 )
 def initialize_analysis_settings(tab, stored_settings):
+    all_symbols = get_all_symbols()  # Get sorted symbols
     if tab == 'analysis' and stored_settings:
         return (
-            stored_settings.get('symbol', 'SPY'),
+            stored_settings.get('symbol', all_symbols[0]),
             stored_settings.get('timeframe', '1D'),
             stored_settings.get('interval', '5min')
         )
-    return 'SPY', '1D', '5min'
+    return all_symbols[0], '1D', '5min'
 
 def create_empty_figure():
     """Create an empty figure with dark theme"""
@@ -3522,10 +3669,7 @@ def create_empty_figure():
     ))
 
 def create_empty_analysis():
-    """
-    Create empty outputs for the analysis dashboard.
-    Returns exactly 11 outputs to match the callback requirements.
-    """
+    """Create empty outputs for the analysis dashboard."""
     empty_fig = create_empty_figure()
     empty_div = html.Div("No data available", style={'color': 'white'})
     empty_settings = {'symbol': 'SPY', 'timeframe': '1D', 'interval': '5min'}
@@ -4117,17 +4261,10 @@ def create_analysis_price_chart(df, symbol, timeframe):
                 autorange=False,            
                 uirevision='shared_x_range',           
                 tickmode='auto',
-                dtick='M5',
-                tickformatstops=[
-                    dict(dtickrange=[None, 1000*60*30], value="%H:%M"),
-                    dict(dtickrange=[1000*60*30, 1000*60*60*2], value="%H:%M"),
-                    dict(dtickrange=[1000*60*60*2, 1000*60*60*4], value="%H:%M"),
-                    dict(dtickrange=[1000*60*60*4, None], value="%H:%M")
-                ] if timeframe != '1Y' else [
-                    dict(dtickrange=[None, None], value="%b %d")    
-                ],
-                tickangle=0,
-                tickfont=dict(size=11)
+                tickformat='%H:%M' if timeframe in ['1D', '2D', '3D', '4D'] else '%b %d',
+                                          dtick='M30' if timeframe in ['1D', '2D', '3D', '4D'] else 'D1',
+                                          hoverformat='%Y-%m-%d'
+                
             ),
             height=745,
             plot_bgcolor='black',
@@ -4178,13 +4315,31 @@ def create_analysis_price_chart(df, symbol, timeframe):
                     x=df['time'],
                     y=df['vwap'],
                     mode='lines',
-                    line=dict(color='purple', width=1),
+                    line=dict(color='#bf40bf', width=2),
                     name='VWAP',
-                    showlegend=True
+                    showlegend=False
                 ),
                 secondary_y=True
             )
-        
+
+            fig.add_annotation(
+                text=f"VWAP: {df['vwap'].iloc[-1]:.2f}",
+                xref='paper',
+                x=1,
+                yref='y2',
+                y=df['vwap'].iloc[-1],
+                xshift=40,
+                yshift=20,  # Offset to not overlap with current pric
+                showarrow=False,
+                font=dict(size=11, color='#bf40bf'),
+                bgcolor='black',
+                bordercolor='#bf40bf',
+                borderwidth=1,
+                borderpad=4,
+                opacity=1
+            )
+
+                                      
         return fig
         
     except Exception as e:
@@ -4346,9 +4501,11 @@ def create_rsi_chart(df, timeframe):
             yaxis=dict(
                 showgrid=True,
                 gridcolor='#1f1f1f',
-                range=[0, 100]
+                range=[0, 100],
+                fixedrange=False  # Enable y-axis panning
             ),
-            margin=dict(l=50, r=50, t=30, b=30)
+            margin=dict(l=50, r=50, t=30, b=30),
+            dragmode='pan'  # Enable panning by default
         )
         
         return fig
