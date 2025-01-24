@@ -7,6 +7,7 @@ import sys
 import requests
 from datetime import datetime, timedelta, time as dt_time
 from py_vollib_vectorized import price_dataframe, get_all_greeks, vectorized_implied_volatility
+from dash.dependencies import ALL
 import numpy as np
 import pytz
 from scipy.stats import norm
@@ -15,7 +16,7 @@ import math
 import time
 import dash
 from dash import dcc, html
-from dash.dependencies import Input, Output, State
+from dash.dependencies import ALL, Output, Input, State
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -195,7 +196,13 @@ def create_dropdown(id, options, value, width='100px', margin_right='10px'):
         }
     )
 
-def create_dashboard_layout():
+def create_dashboard_layout(initial_symbol=None):
+    """
+    Create the dashboard layout with an optional initial symbol parameter.
+    
+    Args:
+        initial_symbol (str, optional): Initial symbol to display. Defaults to None.
+    """
     return html.Div([
         dcc.Interval(
             id='interval-component',
@@ -203,7 +210,7 @@ def create_dashboard_layout():
             n_intervals=0
         ),
         
-        # Header (unchanged)
+        # Header
         html.Div([
             html.Div([
                 html.Div([
@@ -241,12 +248,8 @@ def create_dashboard_layout():
                 
                 dcc.Dropdown(
                     id='symbol-dropdown',
-                    options=[
-                        {'label': symbol, 'value': symbol} 
-                        for symbol in ['SPY', 'QQQ', 'IWM', 'AAPL', 'AMZN', 
-                                     'GOOG', 'META', 'MSFT', 'NVDA', 'TSLA']
-                    ],
-                    value='SPY',
+                    options=[{'label': symbol, 'value': symbol} for symbol in get_all_symbols()],
+                    value=initial_symbol if initial_symbol else 'SPY',
                     style={
                         **DROPDOWN_STYLE,
                         'width': '100px',
@@ -255,12 +258,14 @@ def create_dashboard_layout():
                 ),
                 dcc.Dropdown(
                     id='date-dropdown',
+                    options=[],  # Will be populated by callback
                     style={
                         **DROPDOWN_STYLE,
                         'width': '145px',
                         'marginLeft': '0px'
                     }
                 ),
+
             ], style={
                 'display': 'flex',
                 'alignItems': 'center',
@@ -781,7 +786,7 @@ def create_analysis_layout():
                     html.Div([
                         html.H3('Technical Indicators', style={'color': 'white', 'marginBottom': '15px'}),
                         html.Div([
-                            html.Div('Moving Averages', style={'color': '#888', 'marginBottom': '10px'}),
+                            html.Div('', style={'color': '#888', 'marginBottom': '10px'}),
                             html.Div(id='ma-signals', style={'marginBottom': '20px'})
                         ]),
                         html.Div([
@@ -1048,6 +1053,11 @@ def create_scanner_layout():
 
 # === SECTION 6: MAIN APP LAYOUT ===
 app.layout = html.Div([
+    # Store components
+    dcc.Store(id='analysis-settings', storage_type='session'),
+    dcc.Store(id='default-data-store'),
+    dcc.Store(id='last-symbol-store', storage_type='session'),
+    
     # Tab container with adjusted height and padding
     html.Div([
         dcc.Tabs(
@@ -1151,8 +1161,7 @@ app.layout = html.Div([
         'borderBottom': '1px solid #333'
     }),
     
-    dcc.Store(id='analysis-settings', storage_type='session'),
-
+    
     dcc.Store(id='default-data-store'),
     html.Div(id='tab-content', style={
         'marginTop': '40px',  # Match the header height
@@ -1171,14 +1180,16 @@ app.layout = html.Div([
     'overflowX': 'hidden'
 })
 
+
 # === SECTION 7: TAB CALLBACK ===
 @app.callback(
     Output('tab-content', 'children'),
-    [Input('tabs', 'value')]
+    [Input('tabs', 'value')],
+    [State('last-symbol-store', 'data')]
 )
-def render_content(tab):
+def render_content(tab, stored_symbol):
     if tab == 'dashboard':
-        return create_dashboard_layout()
+        return create_dashboard_layout(initial_symbol=stored_symbol)
     elif tab == 'analysis':
         return create_analysis_layout()
     elif tab == 'scanner':
@@ -1340,13 +1351,13 @@ def get_all_symbols():
 @app.callback(
     [Output('date-dropdown', 'options'),
      Output('date-dropdown', 'value')],
-    [Input('symbol-dropdown', 'value')]
+    [Input('symbol-dropdown', 'value')],
+    prevent_initial_call=True
 )
 def update_date_dropdown(symbol):
     try:
         expiration_dates = get_options_expirations(symbol)
         if not expiration_dates:
-            # If no dates returned, create some default ones
             today = datetime.now()
             expiration_dates = [(today + timedelta(days=x)).strftime('%Y-%m-%d') 
                               for x in range(0, 28, 7)]
@@ -1356,50 +1367,119 @@ def update_date_dropdown(symbol):
         return options, value
     except Exception as e:
         print(f"Error in update_date_dropdown: {str(e)}")
-        # Return default values
         today = datetime.now()
         default_dates = [(today + timedelta(days=x)).strftime('%Y-%m-%d') 
                         for x in range(0, 28, 7)]
         options = [{'label': date, 'value': date} for date in default_dates]
         return options, default_dates[0]
-
 @app.callback(
     [Output('symbol-dropdown', 'options'),
-     Output('symbol-input', 'value')],
-    [Input('add-symbol-button', 'n_clicks')],
+     Output('symbol-input', 'value'),
+     Output('symbol-dropdown', 'value'),
+     Output('last-symbol-store', 'data', allow_duplicate=True)],
+    [Input('add-symbol-button', 'n_clicks'),
+     Input({'type': 'delete-symbol', 'index': ALL}, 'n_clicks'),
+     Input('symbol-dropdown', 'value')],
     [State('symbol-input', 'value'),
-     State('symbol-dropdown', 'options')]
+     State('symbol-dropdown', 'options'),
+     State({'type': 'delete-symbol', 'index': ALL}, 'data-symbol'),
+     State('last-symbol-store', 'data')],
+    prevent_initial_call=True  # Add this line
 )
-def add_symbol(n_clicks, new_symbol, existing_options):
-    if n_clicks is None or not new_symbol:
-        # Initial load - combine default and custom symbols and sort
+def manage_symbols(add_clicks, delete_clicks, selected_symbol, new_symbol, existing_options, delete_symbols, stored_symbol):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        # Initial load - use stored symbol if available
         all_symbols = sorted(get_all_symbols())
-        return [{'label': s, 'value': s} for s in all_symbols], ''
-    
-    # Convert new symbol to uppercase
-    new_symbol = new_symbol.strip().upper()
-    
-    # Validate the symbol using Tradier API
-    if lookup_symbol(new_symbol):
-        # Get existing symbols
-        existing_symbols = [opt['value'] for opt in existing_options]
+        initial_symbol = stored_symbol if stored_symbol else 'SPY'
+        return [create_dropdown_option(s) for s in all_symbols], '', initial_symbol, initial_symbol
+
+    trigger_id = ctx.triggered[0]['prop_id']
+
+    # Handle symbol selection
+    if trigger_id == 'symbol-dropdown.value':
+        return existing_options, '', selected_symbol, selected_symbol
+
+    # Handle Add Symbol
+    elif trigger_id == 'add-symbol-button.n_clicks':
+        if not new_symbol:
+            return existing_options, '', selected_symbol, selected_symbol
+
+        # Convert new symbol to uppercase
+        new_symbol = new_symbol.strip().upper()
         
-        if new_symbol not in existing_symbols:
-            # Add to existing options
-            existing_options.append({'label': new_symbol, 'value': new_symbol})
+        # Validate the symbol using Tradier API
+        if lookup_symbol(new_symbol):
+            existing_symbols = [opt['value'] for opt in existing_options]
             
-            # Save to custom symbols
-            custom_symbols = load_custom_symbols()
-            if new_symbol not in custom_symbols:
-                custom_symbols.append(new_symbol)
-                save_custom_symbols(custom_symbols)
-            
-            return existing_options, ''
-        else:
-            return existing_options, ''
-    else:
-        # If symbol is invalid, return unchanged options
-        return existing_options, new_symbol
+            if new_symbol not in existing_symbols:
+                # Add to existing options
+                custom_symbols = load_custom_symbols()
+                if new_symbol not in custom_symbols:
+                    custom_symbols.append(new_symbol)
+                    save_custom_symbols(custom_symbols)
+                
+                all_symbols = sorted(get_all_symbols())
+                return [create_dropdown_option(s) for s in all_symbols], '', selected_symbol, selected_symbol
+        
+        return existing_options, new_symbol, selected_symbol, selected_symbol
+
+    # Handle Delete Symbol
+    elif '.n_clicks' in str(trigger_id):
+        if not any(delete_clicks):
+            return existing_options, '', selected_symbol, selected_symbol
+
+        # Get the clicked symbol from the triggered id
+        clicked_dict = eval(trigger_id.split('.')[0])
+        clicked_symbol = clicked_dict['index']
+        
+        # Remove from custom symbols
+        custom_symbols = load_custom_symbols()
+        if clicked_symbol in custom_symbols:
+            custom_symbols.remove(clicked_symbol)
+            save_custom_symbols(custom_symbols)
+        
+        # Update dropdown options
+        all_symbols = sorted(get_all_symbols())
+        new_options = [create_dropdown_option(s) for s in all_symbols]
+        
+        # Set new value if we deleted the current symbol
+        new_value = selected_symbol if selected_symbol != clicked_symbol else stored_symbol or 'SPY'
+        
+        return new_options, '', new_value, new_value
+
+    # Default return
+    return existing_options, '', selected_symbol, selected_symbol
+
+def create_dropdown_option(symbol):
+    """Helper function to create consistent dropdown options"""
+    default_symbols = ['SPY', 'QQQ', 'IWM', 'AAPL', 'AMZN', 
+                      'GOOG', 'META', 'MSFT', 'NVDA', 'TSLA']
+    
+    return {
+        'label': html.Div([
+            html.Span(symbol),
+            html.Span('✕', 
+                    id={'type': 'delete-symbol', 'index': symbol},
+                    style={
+                        'marginLeft': '10px',
+                        'cursor': 'pointer',
+                        'color': '#666666',
+                        'float': 'right'
+                    },
+                    **{'data-symbol': symbol}
+            ) if symbol not in default_symbols else None
+        ], style={'display': 'flex', 'justifyContent': 'space-between'}),
+        'value': symbol
+    }
+
+@app.callback(
+    Output('last-symbol-store', 'data'),
+    Input('symbol-dropdown', 'value'),
+    prevent_initial_call=True
+)
+def update_stored_symbol(value):
+    return value
 
 @app.callback(
     Output('symbol-input', 'style'),
@@ -2193,36 +2273,36 @@ def create_histogram(data, current_price, historical_prices, metric_type, skewne
             color=np.where(data[metric_type] >= 0, '#13d133', '#f70a0a'),
             opacity=0.8
         ),
-        width=0.8,
+        width=0.45,
         name=metric_type
     ))
     
     # Add white borders for max values
-    if max_positive is not None:
-        max_pos_strike = data.loc[data[metric_type] == max_positive, 'strike'].iloc[0]
-        fig.add_trace(go.Bar(
-            x=[max_pos_strike],
-            y=[max_positive],
-            marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
-            width=0.79,
-            offset=-0.395,
-            showlegend=False
-        ))
+    #if max_positive is not None:
+        #max_pos_strike = data.loc[data[metric_type] == max_positive, 'strike'].iloc[0]
+        #fig.add_trace(go.Bar(
+            #x=[max_pos_strike],
+            #y=[max_positive],
+            #marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
+            #width=0.50,
+            #offset=-0.25,
+            #showlegend=False
+        #))
     
-    if max_negative is not None:
-        max_neg_strike = data.loc[data[metric_type] == max_negative, 'strike'].iloc[0]
-        fig.add_trace(go.Bar(
-            x=[max_neg_strike],
-            y=[max_negative],
-            marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
-            width=0.79,
-            offset=-0.395,
-            showlegend=False
-        ))    
+    #if max_negative is not None:
+        #max_neg_strike = data.loc[data[metric_type] == max_negative, 'strike'].iloc[0]
+        #fig.add_trace(go.Bar(
+            #x=[max_neg_strike],
+            #y=[max_negative],
+            #marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
+            #width=0.50,
+            #offset=-0.25,
+            #showlegend=False
+        #))    
 
     fig.add_vline(
         x=current_price,
-        line=dict(color="#0d71df", width=2, dash="dash"),
+        line=dict(color="white", width=2, dash="dash"),
         annotation_text=f"{current_price:.2f}",
         annotation_position="top left"
     )
@@ -2278,36 +2358,36 @@ def create_dex_histogram(data, current_price, historical_prices, left_strike, ri
             color=np.where(data['DEX'] >= 0, '#13d133', '#f70a0a'),
             opacity=0.8
         ),
-        width=0.8,
+        width=0.45,
         showlegend=False,
         name='DEX'
     ))
     
-    if max_positive is not None:
-        max_pos_strike = data.loc[data['DEX'] == max_positive, 'strike'].iloc[0]
-        fig.add_trace(go.Bar(
-            x=[max_pos_strike],
-            y=[max_positive],
-            marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
-            width=0.79,
-            offset=-0.395,
-            showlegend=False
-        ))
+    #if max_positive is not None:
+        #max_pos_strike = data.loc[data['DEX'] == max_positive, 'strike'].iloc[0]
+        #fig.add_trace(go.Bar(
+            #x=[max_pos_strike],
+            #y=[max_positive],
+            #marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
+            #width=0.50,
+            #offset=-0.25,
+            #showlegend=False
+        #))
     
-    if max_negative is not None:
-        max_neg_strike = data.loc[data['DEX'] == max_negative, 'strike'].iloc[0]
-        fig.add_trace(go.Bar(
-            x=[max_neg_strike],
-            y=[max_negative],
-            marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
-            width=0.79,
-            offset=-0.395,
-            showlegend=False
-        ))
+    #if max_negative is not None:
+        #max_neg_strike = data.loc[data['DEX'] == max_negative, 'strike'].iloc[0]
+        #fig.add_trace(go.Bar(
+            #x=[max_neg_strike],
+            #y=[max_negative],
+            #marker=dict(color='rgba(0,0,0,0)', line=dict(color='white', width=1)),
+            #width=0.50,
+            #offset=-0.25,
+            #showlegend=False
+        #))
     
     fig.add_vline(
         x=current_price,
-        line=dict(color="#0d71df", width=2, dash="dash"),
+        line=dict(color="white", width=2, dash="dash"),
         annotation_text=f"{current_price:.2f}",
         annotation_position="top left"
     )
@@ -2597,6 +2677,14 @@ def create_candlestick_figure(df, timeframe, gex_levels, current_price, symbol, 
 
     fig.add_trace(go.Scatter(
         x=df['time'],
+        y=df['EMA50'],
+        line=dict(color='blue', width=2, dash='solid'),
+        name='50 EMA',
+        connectgaps=True
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=df['time'],
         y=df['SMA200'],
         line=dict(color='#FF00FF', width=4, dash='dot'),
         name='200 SMA',
@@ -2836,14 +2924,67 @@ def get_advances_declines(is_sandbox=False):
     
     return fig1, fig5, fig_daily
 
-def create_ma_signals(df):
-    """Generate moving average signals with TTM Squeeze status and VWAP"""
+def create_ma_signals(df, gex_levels=None):
+    """Generate moving average signals with GEX levels and TTM Squeeze status"""
     try:
         if df is None or df.empty:
             return html.Div("No data available", style={'color': 'white'})
-        
+            
         signals = []
         
+        # GEX Levels Section
+        signals.append(html.Div("GEX Levels", style={
+            'color': '#888',
+            'marginBottom': '10px',
+            'fontSize': '16px'            
+        }))
+        
+        if gex_levels:
+            # Sort GEX levels
+            pos_levels = [(level, value) for level, value in gex_levels if value > 0]
+            neg_levels = [(level, value) for level, value in gex_levels if value < 0]
+            
+            # Sort by absolute value
+            pos_levels.sort(key=lambda x: abs(x[1]), reverse=True)
+            neg_levels.sort(key=lambda x: abs(x[1]), reverse=True)
+            
+            # Take top 4 of each
+            pos_levels = pos_levels[:4]
+            neg_levels = neg_levels[:4]
+            
+            # Add positive GEX levels
+            for i, (level, value) in enumerate(pos_levels, 1):
+                signals.append(html.Div(
+                    f"+GEX {i}: {level:.2f} ({value/1000:.1f}k)", 
+                    style={
+                        'color': '#13d133',
+                        'marginLeft': '10px',
+                        'fontSize': '13px',
+                        'marginBottom': '2px'
+                    }
+                ))
+            
+            # Add negative GEX levels
+            for i, (level, value) in enumerate(neg_levels, 1):
+                signals.append(html.Div(
+                    f"-GEX {i}: {level:.2f} ({abs(value)/1000:.1f}k)", 
+                    style={
+                        'color': '#f70a0a',
+                        'marginLeft': '10px',
+                        'fontSize': '13px',                        
+                        'marginBottom': '2px'
+                    }
+                ))
+            
+            signals.append(html.Div(style={'marginBottom': '15px'}))
+
+        # Moving Averages Section Title
+        signals.append(html.Div("Moving Averages", style={
+            'color': '#888',
+            'marginBottom': '10px',
+            'fontSize': '17px'            
+        }))
+
         # MA Signals
         if 'EMA20' in df.columns and 'EMA50' in df.columns:
             if df['EMA20'].iloc[-1] > df['EMA50'].iloc[-1]:
@@ -2867,7 +3008,7 @@ def create_ma_signals(df):
             squeeze_text += f" ({squeeze_bars} bars)"
         
         signals.append(html.Div([
-            html.Div("TTM Squeeze:", style={'color': '#888', 'marginTop': '10px'}),
+            html.Div("TTM Squeeze", style={'color': '#888', 'marginTop': '10px'}),
             html.Div(squeeze_text, style={'color': squeeze_color})
         ]))
         
@@ -2880,7 +3021,7 @@ def create_ma_signals(df):
             vwap_text = f"Above VWAP" if current_price > vwap else "Below VWAP"
             
             signals.append(html.Div([
-                html.Div("VWAP Status:", style={'color': '#888', 'marginTop': '10px'}),
+                html.Div("VWAP Status", style={'color': '#888', 'marginTop': '10px'}),
                 html.Div(f"{vwap_text} (VWAP: {vwap:.2f})", style={'color': vwap_color})
             ]))
         
@@ -3561,66 +3702,147 @@ def create_tick_matrix(total_gex, total_vex, total_dex, total_vega, state_number
      State('analysis-settings', 'data')],
     prevent_initial_call=True
 )
+
 def update_analysis_content(n_intervals, n_clicks, symbol, timeframe, interval, stored_settings):
-    # Initialize with empty analysis
+    """Update all analysis content with improved performance and consistency"""
     empty_results = create_empty_analysis()
     
     try:
-        # If no symbol or no trigger, return empty
         if not symbol:
             return empty_results
             
-        # Use stored settings if available and no explicit inputs
         if n_clicks is None and n_intervals == 0:
             if stored_settings:
                 symbol = stored_settings.get('symbol', 'SPY')
                 timeframe = stored_settings.get('timeframe', '1D')
                 interval = stored_settings.get('interval', '5min')
             else:
-                symbol = 'SPY'
-                timeframe = '1D'
-                interval = '5min'
-        
-        # Get data
-        df = get_data_for_timeframe_and_interval(symbol, timeframe, interval)
-        if df is None or df.empty:
-            return empty_results
-        
-        # Store current settings
+                return empty_results
+
         current_settings = {
             'symbol': symbol,
             'timeframe': timeframe,
             'interval': interval
         }
         
-        # Get current price and calculate day change
         current_price = get_current_price(symbol)
         prev_close = get_previous_close(symbol)
-        day_change = current_price - prev_close if all(x is not None for x in [current_price, prev_close]) else 0
         
-        # Create header price display
+        if current_price is None or prev_close is None:
+            return empty_results
+            
+        day_change = current_price - prev_close
+        
         header_price = html.Div([
             html.Span(f"{symbol}: ", style={'color': 'white'}),
-            html.Span(f"{current_price:.2f} ", style={'color': '#32CD32' if day_change >= 0 else '#FF0000'}),
-            html.Span(f"({'↑' if day_change >= 0 else '↓'}{abs(day_change):.2f})", 
+            html.Span(f"{current_price:.2f} ", 
+                     style={'color': '#32CD32' if day_change >= 0 else '#FF0000'}),
+            html.Span(f"({'↑' if day_change >= 0 else '↓'}{abs(day_change):.2f})",
                      style={'color': '#32CD32' if day_change >= 0 else '#FF0000'})
         ])
 
-        # Create all required outputs
-        return (
-            create_analysis_price_chart(df, symbol, timeframe),  # price chart
-            create_rsi_chart(df, timeframe),                     # rsi chart with timeframe parameter
-            create_ma_signals(df),                               # ma signals
-            create_oscillator_signals(df),                       # oscillator signals
-            calculate_pivot_points(df),                          # pivot points
-            identify_support_levels(df),                         # support levels
-            identify_resistance_levels(df),                      # resistance levels
-            calculate_iv_percentile(get_options_data(symbol, datetime.now().strftime('%Y-%m-%d'))),  # iv percentile
-            calculate_put_call_ratio(get_options_data(symbol, datetime.now().strftime('%Y-%m-%d'))), # put/call ratio
-            header_price,                                        # header price
-            current_settings                                     # settings
-        )
+        cache_key = f"{symbol}_{timeframe}_{interval}"
         
+        if n_intervals and cache_key in data_cache:
+            cache_data = data_cache[cache_key]
+            if (datetime.now() - cache_data['timestamp']).seconds < 5:
+                cached_results = cache_data['data']
+                if cached_results[0] is not None:
+                    cached_results[0] = update_price_chart_price(cached_results[0], current_price)
+                return [
+                    cached_results[0],
+                    cached_results[1],
+                    cached_results[2],
+                    cached_results[3],
+                    cached_results[4],
+                    cached_results[5],
+                    cached_results[6],
+                    cached_results[7],
+                    cached_results[8],
+                    header_price,
+                    current_settings
+                ]
+
+        if interval == '1min':
+            df = get_historical_prices_1min(symbol)
+            if df is None or df.empty:
+                print("Failed to get 1-minute data, falling back to 5-minute")
+                interval = '5min'
+                df = get_data_for_timeframe_and_interval(symbol, timeframe, '5min')
+        else:
+            df = get_data_for_timeframe_and_interval(symbol, timeframe, interval)
+
+        if df is None or df.empty:
+            print(f"No data available for {symbol} with {interval} interval")
+            return empty_results
+
+        df = process_dataframe(df, timeframe)
+        if df is None or df.empty:
+            return empty_results
+
+        df = calculate_technical_indicators(df)
+
+        # Get options data and calculate GEX levels
+        today = datetime.now().strftime('%Y-%m-%d')
+        options_data = get_options_data(symbol, today)
+        gex_levels = []
+
+        if options_data is not None and not options_data.empty:
+            dataframe = calculate_greeks(options_data, current_price, .0548)
+            if dataframe is not None and not dataframe.empty:
+                gex_by_strike = dataframe.groupby('strike', group_keys=False).apply(
+                    lambda x: sum(
+                        x[x['option_type'] == 'call']['gamma'] * 
+                        x[x['option_type'] == 'call']['open_interest'] * 
+                        100 * current_price * current_price * 0.01
+                    ) + sum(
+                        x[x['option_type'] == 'put']['gamma'] * 
+                        x[x['option_type'] == 'put']['open_interest'] * 
+                        100 * current_price * current_price * 0.01 * -1
+                    )
+                ).reset_index(name='GEX')
+
+                pos_gex = gex_by_strike[gex_by_strike['GEX'] > 0].nlargest(4, 'GEX')
+                neg_gex = gex_by_strike[gex_by_strike['GEX'] < 0].nsmallest(4, 'GEX')
+
+                if not pos_gex.empty:
+                    gex_levels.extend(list(zip(pos_gex['strike'], pos_gex['GEX'])))
+                if not neg_gex.empty:
+                    gex_levels.extend(list(zip(neg_gex['strike'], neg_gex['GEX'])))
+        
+        # Create all visualizations
+        price_chart = create_analysis_price_chart(df, symbol, timeframe, gex_levels)
+        rsi_chart = create_rsi_chart(df, timeframe)
+        ma_signals = create_ma_signals(df, gex_levels)  # Pass gex_levels here
+        oscillator_signals = create_oscillator_signals(df)
+        pivot_points = calculate_pivot_points(df)
+        support_levels = identify_support_levels(df)
+        resistance_levels = identify_resistance_levels(df)
+        
+        iv_percentile = calculate_iv_percentile(options_data)
+        put_call_ratio = calculate_put_call_ratio(options_data)
+
+        results = [
+            price_chart,
+            rsi_chart,
+            ma_signals,
+            oscillator_signals,
+            pivot_points,
+            support_levels,
+            resistance_levels,
+            iv_percentile,
+            put_call_ratio,
+            header_price,
+            current_settings
+        ]
+        
+        data_cache[cache_key] = {
+            'timestamp': datetime.now(),
+            'data': results
+        }
+
+        return results
+
     except Exception as e:
         print(f"Error in update_analysis_content: {str(e)}")
         traceback.print_exc()
@@ -3674,7 +3896,7 @@ def create_empty_analysis():
     empty_div = html.Div("No data available", style={'color': 'white'})
     empty_settings = {'symbol': 'SPY', 'timeframe': '1D', 'interval': '5min'}
     
-    return (
+    return [
         empty_fig,        # analysis-price-chart.figure
         empty_fig,        # rsi-chart.figure
         empty_div,        # ma-signals.children
@@ -3686,7 +3908,7 @@ def create_empty_analysis():
         empty_div,        # put-call-ratio.children
         empty_div,        # analysis-header-price.children
         empty_settings    # analysis-settings.data
-    )
+    ]
 
 def calculate_rsi(prices, period=14):
     """Calculate RSI indicator with improved error handling"""
@@ -4087,7 +4309,7 @@ def filter_regular_trading_hours(df):
     
     return df
 
-def create_analysis_price_chart(df, symbol, timeframe):
+def create_analysis_price_chart(df, symbol, timeframe, gex_levels=None):
     """Create price chart with VWAP for analysis tab"""
     if df is None or df.empty:
         return create_empty_figure()
@@ -4102,6 +4324,12 @@ def create_analysis_price_chart(df, symbol, timeframe):
         
         if df.empty:  # Check again after filtering
             return create_empty_figure()
+
+        layout_updates = {
+            'xaxis': {
+                'domain': [0, 1]  # Extend chart to full width
+            }
+        }
         
         # Get current price early
         current_price = get_current_price(symbol)
@@ -4147,8 +4375,7 @@ def create_analysis_price_chart(df, symbol, timeframe):
                 opacity=0.3,
                 name='Volume',
                 showlegend=False,
-                hovertemplate='Volume: %{customdata:,.0f}<extra></extra>',
-                customdata=df[green_volume_mask]['volume']
+                hoverinfo='skip' 
             ),
             secondary_y=False
         )
@@ -4162,8 +4389,7 @@ def create_analysis_price_chart(df, symbol, timeframe):
                 opacity=0.3,
                 name='Volume',
                 showlegend=False,
-                hovertemplate='Volume: %{customdata:,.0f}<extra></extra>',
-                customdata=df[red_volume_mask]['volume']
+                hoverinfo='skip' 
             ),
             secondary_y=False
         )
@@ -4191,6 +4417,82 @@ def create_analysis_price_chart(df, symbol, timeframe):
             secondary_y=True
         )
 
+        # Add GEX levels if provided
+        if gex_levels:
+            num_levels = 4 if timeframe == '1D' else 4
+            pos_levels = [(level, value) for level, value in gex_levels if value > 0][:num_levels]
+            neg_levels = [(level, value) for level, value in gex_levels if value < 0][:num_levels]
+            
+            time_end = df['time'].max() + pd.Timedelta(hours=4)
+            
+            # Add positive GEX levels
+            for i, (level, value) in enumerate(pos_levels, 1):
+                line_width = 5 if i == 1 else 2
+                dash_style = 'solid' if i == 1 else 'dash'
+                
+                # Add GEX line
+                fig.add_trace(
+                    go.Scatter(
+                        x=[df['time'].min(), time_end],
+                        y=[level, level],
+                        mode='lines',
+                        line=dict(color='#13d133', width=line_width, dash=dash_style),
+                        name=f'+GEX {i}',
+                        showlegend=False,
+                        hoverinfo='skip' 
+                    ),
+                    secondary_y=True
+                )
+                
+                # Add annotation slightly above the line
+                fig.add_annotation(
+                    text=f"+GEX {i}: {level:.2f}",
+                    x=time_end,
+                    y=level,
+                    xref='x',
+                    yref='y2',
+                    xanchor='right',
+                    yanchor='bottom',
+                    yshift=2,
+                    showarrow=False,
+                    font=dict(size=10, color='#13d133'),
+                    xshift=-5
+                )
+            
+            # Add negative GEX levels
+            for i, (level, value) in enumerate(neg_levels, 1):
+                line_width = 5 if i == 1 else 2
+                dash_style = 'solid' if i == 1 else 'dash'
+                
+                # Add GEX line
+                fig.add_trace(
+                    go.Scatter(
+                        x=[df['time'].min(), time_end],
+                        y=[level, level],
+                        mode='lines',
+                        line=dict(color='#f70a0a', width=line_width, dash=dash_style),
+                        name=f'-GEX {i}',
+                        showlegend=False,
+                        hoverinfo='skip' 
+                    ),
+                    secondary_y=True
+                )
+                
+                # Add annotation slightly above the line
+                fig.add_annotation(
+                    text=f"-GEX {i}: {level:.2f}",
+                    x=time_end,
+                    y=level,
+                    xref='x',
+                    yref='y2',
+                    xanchor='right',
+                    yanchor='bottom',
+                    yshift=2,
+                    showarrow=False,
+                    font=dict(size=10, color='#f70a0a'),
+                    xshift=-5
+                )
+
         # Add TTM Squeeze dots if available
         if 'Squeeze' in df.columns:
             squeeze_points_x = df[df['Squeeze']]['time']
@@ -4212,7 +4514,7 @@ def create_analysis_price_chart(df, symbol, timeframe):
         if current_price:
             fig.add_hline(
                 y=current_price,
-                line=dict(color='#0c0ce8', width=2, dash='dot'),
+                line=dict(color='white', width=2, dash='dot'),
                 secondary_y=True
             )
             
@@ -4237,6 +4539,37 @@ def create_analysis_price_chart(df, symbol, timeframe):
         # Add supply and demand zones
         visible_range.add_zones_to_chart(fig, df)
 
+        if timeframe != '1Y' and 'vwap' in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df['time'],
+                    y=df['vwap'],
+                    mode='lines',
+                    line=dict(color='#bf40bf', width=2),
+                    name='VWAP',
+                    showlegend=False,
+                    hoverinfo='skip' 
+                ),
+                secondary_y=True
+            )
+
+            fig.add_annotation(
+                text=f"VWAP: {df['vwap'].iloc[-1]:.2f}",
+                xref='paper',
+                x=1,
+                yref='y2',
+                y=df['vwap'].iloc[-1],
+                xshift=40,
+                yshift=20,  # Offset to not overlap with current price
+                showarrow=False,
+                font=dict(size=11, color='#bf40bf'),
+                bgcolor='black',
+                bordercolor='#bf40bf',
+                borderwidth=1,
+                borderpad=4,
+                opacity=1
+            )
+
         # Update layout with proper axes configuration
         fig.update_layout(
             template="plotly_dark",
@@ -4256,20 +4589,19 @@ def create_analysis_price_chart(df, symbol, timeframe):
                 showline=True,
                 showgrid=True,
                 gridcolor='#1f1f1f',
-                domain=[0.05, 1],
+                domain=[0, 1],  # Extend chart to full width
                 range=initial_range,
                 autorange=False,            
                 uirevision='shared_x_range',           
                 tickmode='auto',
                 tickformat='%H:%M' if timeframe in ['1D', '2D', '3D', '4D'] else '%b %d',
-                                          dtick='M30' if timeframe in ['1D', '2D', '3D', '4D'] else 'D1',
-                                          hoverformat='%Y-%m-%d'
-                
+                dtick='M30' if timeframe in ['1D', '2D', '3D', '4D'] else 'D1',
+                hoverformat='%Y-%m-%d'
             ),
             height=745,
             plot_bgcolor='black',
             paper_bgcolor='black',
-            margin=dict(l=50, r=50, t=50, b=50),
+            margin=dict(l=0, r=50, t=50, b=50),
             legend=dict(
                 yanchor="top",
                 y=1.1,
@@ -4308,37 +4640,6 @@ def create_analysis_price_chart(df, symbol, timeframe):
             showticklabels=False,
             range=[0, volume_max * 2]
         )
-
-        if timeframe != '1Y' and 'vwap' in df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=df['time'],
-                    y=df['vwap'],
-                    mode='lines',
-                    line=dict(color='#bf40bf', width=2),
-                    name='VWAP',
-                    showlegend=False
-                ),
-                secondary_y=True
-            )
-
-            fig.add_annotation(
-                text=f"VWAP: {df['vwap'].iloc[-1]:.2f}",
-                xref='paper',
-                x=1,
-                yref='y2',
-                y=df['vwap'].iloc[-1],
-                xshift=40,
-                yshift=20,  # Offset to not overlap with current pric
-                showarrow=False,
-                font=dict(size=11, color='#bf40bf'),
-                bgcolor='black',
-                bordercolor='#bf40bf',
-                borderwidth=1,
-                borderpad=4,
-                opacity=1
-            )
-
                                       
         return fig
         
@@ -4346,6 +4647,101 @@ def create_analysis_price_chart(df, symbol, timeframe):
         print(f"Error creating analysis price chart: {str(e)}")
         traceback.print_exc()
         return create_empty_figure()
+
+def update_price_chart_price(fig, current_price):
+    """
+    Update only price-sensitive elements of the chart without redrawing everything.
+    
+    Args:
+        fig (go.Figure): Existing plotly figure
+        current_price (float): Current price to update
+        
+    Returns:
+        go.Figure: Updated figure with new price
+    """
+    if fig is None:
+        return create_empty_figure()
+    
+    try:
+        # Get previous close for color determination
+        prev_close = get_previous_close(fig.layout.title.text.split()[0])  # Extract symbol from title
+        price_color = '#32CD32' if current_price >= prev_close else '#FF0000' if prev_close else 'white'
+        
+        # Update current price line
+        for trace in fig.data:
+            if hasattr(trace, 'name') and trace.name == "Current Price":
+                trace.y = [current_price, current_price]
+        
+        # Add or update current price line if it doesn't exist
+        price_line_exists = any(hasattr(trace, 'name') and trace.name == "Current Price" for trace in fig.data)
+        if not price_line_exists:
+            fig.add_hline(
+                y=current_price,
+                line=dict(color='white', width=2, dash='dot'),
+                name="Current Price",
+                secondary_y=False
+            )
+        
+        # Update price annotation
+        new_annotation = dict(
+            text=f"{current_price:.2f}",
+            xref='paper',
+            x=1,
+            yref='y2',
+            y=current_price,
+            xshift=40,
+            showarrow=False,
+            font=dict(size=14, color=price_color),
+            bgcolor='black',
+            bordercolor='white',
+            borderwidth=1,
+            borderpad=4,
+            opacity=1
+        )
+        
+        # Remove old price annotation and add new one
+        fig.layout.annotations = [ann for ann in fig.layout.annotations if not ann.text.replace('.', '').isdigit()]
+        fig.add_annotation(new_annotation)
+        
+        return fig
+        
+    except Exception as e:
+        print(f"Error updating price chart: {str(e)}")
+        traceback.print_exc()
+        return fig
+
+def get_historical_prices_1min_improved(symbol, start_time=None):
+    """Improved 1-minute data retrieval with better error handling and caching"""
+    try:
+        cache_key = f"{symbol}_1min"
+        current_time = datetime.now()
+        
+        # Check cache first
+        if cache_key in data_cache:
+            cached_data = data_cache[cache_key]
+            if (current_time - cached_data['timestamp']).seconds < 5:
+                return cached_data['data']
+        
+        if start_time is None:
+            start_time = current_time.replace(hour=4, minute=0, second=0, microsecond=0)
+        
+        response = await_response(get_historical_prices_1min(symbol))
+        if response.empty:
+            return pd.DataFrame()
+            
+        df = process_dataframe(response, '1-minute')
+        
+        # Cache the result
+        data_cache[cache_key] = {
+            'timestamp': current_time,
+            'data': df
+        }
+        
+        return df
+        
+    except Exception as e:
+        print(f"Error in get_historical_prices_1min_improved: {str(e)}")
+        return pd.DataFrame()
 
 def calculate_vwap(df):
     """Calculate VWAP for the given dataframe"""
@@ -4478,15 +4874,18 @@ def create_rsi_chart(df, timeframe):
         
         # Add overbought/oversold lines
         fig.add_hline(y=70, line_dash="dash", line_color="red", 
-                     annotation_text="Overbought", annotation_position="left")
+                     annotation_text="Overbought")
         fig.add_hline(y=30, line_dash="dash", line_color="green", 
-                     annotation_text="Oversold", annotation_position="left")
+                     annotation_text="Oversold")
+        fig.add_hline(y=50, line_dash="dash", line_color="#5e5e5e", 
+                     annotation_text="Neutral")
+
         
         # Update layout
         fig.update_layout(
             template="plotly_dark",
             title="RSI Indicator",
-            height=200,
+            height=300,
             showlegend=False,
             plot_bgcolor='black',
             paper_bgcolor='black',
@@ -4633,7 +5032,7 @@ class VisibleRange:
                         y=[self.supply_box['bottom'], self.supply_box['top'], 
                            self.supply_box['top'], self.supply_box['bottom']],
                         fill="toself",
-                        fillcolor="rgba(255, 0, 0, 0.1)",
+                        fillcolor="rgba(13, 113, 223, 0.2)",  # Blue with transparency
                         line=dict(width=0),
                         showlegend=False,
                         hoverinfo='none'
@@ -4647,7 +5046,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.supply_box['bottom'], self.supply_box['bottom']],
                         mode='lines',
-                        line=dict(color='red', width=1),
+                        line=dict(color='#0d71df', width=1),
                         showlegend=False,
                         hoverinfo='none'
                     ),
@@ -4659,7 +5058,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.supply_box['top'], self.supply_box['top']],
                         mode='lines',
-                        line=dict(color='red', width=1),
+                        line=dict(color='#0d71df', width=1),
                         showlegend=False,
                         hoverinfo='none'
                     ),
@@ -4672,7 +5071,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.supply_avg, self.supply_avg],
                         mode='lines',
-                        line=dict(color='red', width=1),
+                        line=dict(color='#0d71df', width=0.5),
                         showlegend=False,
                         hoverinfo='none'
                     ),
@@ -4684,7 +5083,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.supply_wavg, self.supply_wavg],
                         mode='lines',
-                        line=dict(color='red', width=1, dash='dash'),
+                        line=dict(color='rgba(13, 113, 223, 0)', width=1, dash='dash'),
                         showlegend=False,
                         hoverinfo='none'
                     ),
@@ -4699,7 +5098,7 @@ class VisibleRange:
                         y=[self.demand_box['bottom'], self.demand_box['top'], 
                            self.demand_box['top'], self.demand_box['bottom']],
                         fill="toself",
-                        fillcolor="rgba(0, 255, 0, 0.1)",
+                        fillcolor="rgba(255, 165, 0, 0.2)",  # Orange with transparency
                         line=dict(width=0),
                         showlegend=False,
                         hoverinfo='none'
@@ -4713,7 +5112,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.demand_box['bottom'], self.demand_box['bottom']],
                         mode='lines',
-                        line=dict(color='green', width=1),
+                        line=dict(color='#FFA500', width=1),
                         showlegend=False,
                         hoverinfo='none'
                     ),
@@ -4725,7 +5124,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.demand_box['top'], self.demand_box['top']],
                         mode='lines',
-                        line=dict(color='green', width=1),
+                        line=dict(color='#FFA500', width=1),
                         showlegend=False,
                         hoverinfo='none'
                     ),
@@ -4738,7 +5137,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.demand_avg, self.demand_avg],
                         mode='lines',
-                        line=dict(color='green', width=1),
+                        line=dict(color='#FFA500', width=0.5),
                         showlegend=False,
                         hoverinfo='none'
                     ),
@@ -4750,7 +5149,7 @@ class VisibleRange:
                         x=[df['time'].min(), time_end],
                         y=[self.demand_wavg, self.demand_wavg],
                         mode='lines',
-                        line=dict(color='green', width=1, dash='dash'),
+                        line=dict(color='rgba(255, 165, 0, 0)', width=1, dash='dash'),
                         showlegend=False,
                         hoverinfo='none'
                     ),
